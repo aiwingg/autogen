@@ -86,8 +86,8 @@ const RenderToolResult: React.FC<{ content: FunctionExecutionResult[] }> = ({
           <DraftingCompass className="w-4 text-accent h-4 inline-block mr-1.5 -mt-0.5" />{" "}
           Tool Result
         </div>
-        <TruncatableText
-          content={result.content}
+        <div
+          dangerouslySetInnerHTML={{ __html: result.content }}
           className="text-sm mt-1 bg-secondary p-2 border border-secondary rounded scroll overflow-x-scroll"
         />
       </div>
@@ -175,7 +175,7 @@ export const RenderMessage: React.FC<MessageProps> = ({
         >
           {isUser ? (
             <User size={14} />
-          ) : message.source == "llm_call_event" ? (
+          ) : message.source == "memory_agent" ? (
             <Brain size={14} />
           ) : (
             <Bot size={14} />

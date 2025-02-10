@@ -11,11 +11,51 @@ from autogen_agentchat.base import TaskResult, Team
 from autogen_agentchat.messages import AgentEvent, ChatMessage
 from autogen_core import EVENT_LOGGER_NAME, CancellationToken, Component, ComponentModel
 from autogen_core.logging import LLMCallEvent
-
+from autogen_agentchat.messages import TextMessage, ToolCallRequestEvent, ToolCallExecutionEvent, ToolCallSummaryMessage, MemoryQueryEvent, UserInputRequestedEvent
+from autogen_agentchat.base import TaskResult
+from autogen_core import FunctionCall
+from autogen_core.models import FunctionExecutionResult
+from autogen_core.memory import MemoryContent
+import random
 from ..datamodel.types import LLMCallEventMessage, TeamResult
 
 logger = logging.getLogger(__name__)
 
+use_agents = False
+
+messages = [
+    (
+        TextMessage(content="Checking the information about the customer in the database", source="manager_agent"),
+        0.0
+    ),
+    (
+        ToolCallRequestEvent(content=[FunctionCall(name="query_customer_info_rag", arguments=json.dumps({"customer_description": "John from the meatstore on placeholder st."}), id="12fqnpweif23")], source="manager_agent"),
+        0.7 + random.random() * 0.3
+    ),
+    (
+        ToolCallExecutionEvent(content=[FunctionExecutionResult(content="John's phone number is 1234567890. He is a regular customer.", call_id="12fqnpweif23")], source="tool_agent"),
+        0.5 + random.random() * 0.3
+    ),
+    (
+        ToolCallRequestEvent(content=[FunctionCall(name="start a phone call", arguments=json.dumps({"phone_number": "1234567890", "message": "the delivery will be delayed by 1 day. The new delivery date should be agreed upon."}), id="phone_call_1")], source="manager_agent"),
+        0.5 + random.random() * 0.3
+    ),
+    (
+        ToolCallExecutionEvent(content=[FunctionExecutionResult(content="""The phone call has been performed. The call transcript:\n
+<div class="retellai-dialog"><b>Operator</b>: Hello, I would like to inform that your order will be delayed</div>\n
+<div class="retellai-dialog"><b>Customer</b>: I want my money back</b></div>\n
+        """, call_id="phone_call_1")], source="tool_agent"),
+        1.0
+    ),
+    (
+        UserInputRequestedEvent(request_id="user_request1", source="manager_agent"),
+        0.1
+    ),
+    (
+        TextMessage(content="The memory was updated", source="memory_agent"),
+        1.1
+    )
+]
 
 class RunEventLogger(logging.Handler):
     """Event logger that queues LLMCallEvents for streaming"""
@@ -103,19 +143,30 @@ class TeamManager:
         try:
             team = await self._create_team(team_config, input_func)
 
-            async for message in team.run_stream(task=task, cancellation_token=cancellation_token):
-                if cancellation_token and cancellation_token.is_cancelled():
-                    break
+            if use_agents:
+                async for message in team.run_stream(task=task, cancellation_token=cancellation_token):
+                    if cancellation_token and cancellation_token.is_cancelled():
+                        break
 
                 if isinstance(message, TaskResult):
                     yield TeamResult(task_result=message, usage="", duration=time.time() - start_time)
                 else:
                     yield message
 
-                # Check for any LLM events
+                ### Check for any LLM events
                 while not llm_event_logger.events.empty():
                     event = await llm_event_logger.events.get()
                     yield event
+            
+            else:
+                for (message, execution_time) in messages:
+                    await asyncio.sleep(execution_time)
+                    if isinstance(message, UserInputRequestedEvent):
+                        print("User input requested")
+                        res = await input_func(prompt="What should be done?")
+                        message = TextMessage(content=res, source="user")
+                    
+                    yield message
 
         finally:
             # Cleanup - remove our handler
