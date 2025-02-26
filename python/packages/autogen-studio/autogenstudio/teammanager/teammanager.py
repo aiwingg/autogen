@@ -137,10 +137,7 @@ class TeamManager:
         start_time = time.time()
 
         try:
-            # Initialize the response loader
             await self.initialize_loader()
-
-            # Send the task to prod
             result = await self.response_loader.add_request(input_text=task)
             task_id = result.get("task_id")
 
@@ -154,17 +151,38 @@ class TeamManager:
                 result = await self.response_loader.get_result(task_id)
                 if result["status"] == "completed":
                     logger.info(f"Got result {result}")
+                    
+                    # Отправляем основной ответ
                     yield TextMessage(
                         content=result.get("response", "No response"),
                         source="prod_system"
                     )
-                    break
-                await asyncio.sleep(1)
 
-            # yield TextMessage(
-            #     content="Something went wrong...",
-            #     source="system"
-            # )
+                    dialogue_history = result.get("dialogue_history", {}).get("context", [])
+                    if dialogue_history:
+                        memory_contents = []
+                        for msg in dialogue_history:
+                            if msg.get("type") == "AssistantMessage":
+                                content = msg.get("content", "")
+                                if isinstance(content, str):
+                                    memory_contents.append(
+                                        MemoryContent(
+                                            content=content,
+                                            role="assistant",
+                                            mime_type="text/plain"
+                                        )
+                                    )
+
+                        if memory_contents:
+                            yield MemoryQueryEvent(
+                                query="dialogue_history",
+                                results=memory_contents,
+                                source="memory",
+                                content="Retrieved dialogue history"
+                            )
+                    break
+                    
+                await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"Error in run_stream: {str(e)}")
