@@ -16,46 +16,12 @@ from autogen_agentchat.base import TaskResult
 from autogen_core import FunctionCall
 from autogen_core.models import FunctionExecutionResult
 from autogen_core.memory import MemoryContent
-import random
 from ..datamodel.types import LLMCallEventMessage, TeamResult
+from .system_response_loader import SystemResponseLoader
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
-use_agents = False
-
-messages = [
-    (
-        TextMessage(content="Checking the information about the customer in the database", source="manager_agent"),
-        0.0
-    ),
-    (
-        ToolCallRequestEvent(content=[FunctionCall(name="query_customer_info_rag", arguments=json.dumps({"customer_description": "John from the meatstore on placeholder st."}), id="12fqnpweif23")], source="manager_agent"),
-        0.7 + random.random() * 0.3
-    ),
-    (
-        ToolCallExecutionEvent(content=[FunctionExecutionResult(content="John's phone number is 1234567890. He is a regular customer.", call_id="12fqnpweif23")], source="tool_agent"),
-        0.5 + random.random() * 0.3
-    ),
-    (
-        ToolCallRequestEvent(content=[FunctionCall(name="start a phone call", arguments=json.dumps({"phone_number": "1234567890", "message": "the delivery will be delayed by 1 day. The new delivery date should be agreed upon."}), id="phone_call_1")], source="manager_agent"),
-        0.5 + random.random() * 0.3
-    ),
-    (
-        ToolCallExecutionEvent(content=[FunctionExecutionResult(content="""The phone call has been performed. The call transcript:\n
-<div class="retellai-dialog"><b>Operator</b>: Hello, I would like to inform that your order will be delayed</div>\n
-<div class="retellai-dialog"><b>Customer</b>: I want my money back</b></div>\n
-        """, call_id="phone_call_1")], source="tool_agent"),
-        1.0
-    ),
-    (
-        UserInputRequestedEvent(request_id="user_request1", source="manager_agent"),
-        0.1
-    ),
-    (
-        TextMessage(content="The memory was updated", source="memory_agent"),
-        1.1
-    )
-]
 
 class RunEventLogger(logging.Handler):
     """Event logger that queues LLMCallEvents for streaming"""
@@ -71,6 +37,43 @@ class RunEventLogger(logging.Handler):
 
 class TeamManager:
     """Manages team operations including loading configs and running teams"""
+
+    def __init__(self):
+        self.response_loader = None
+        self.server_address = "http://172.17.0.1:51005"
+        logger.info(f"Initialized TeamManager with server address: {self.server_address}")
+
+    async def initialize_loader(self):
+        """Initialize the SystemResponseLoader if not already initialized"""
+        if self.response_loader is None:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        logger.info(f"Attempting to connect to server at {self.server_address}")
+                        async with session.get(
+                            f"{self.server_address}/health", 
+                            timeout=5,
+                            ssl=False
+                        ) as response:
+                            if response.status == 200:
+                                logger.info(f"Successfully connected to server at {self.server_address}")
+                            else:
+                                logger.warning(f"Server responded with status {response.status}")
+                                logger.warning(f"Response body: {await response.text()}")
+                    except Exception as e:
+                        logger.error(f"Connection error: {str(e)}")
+                        raise ConnectionError(f"Could not connect to server at {self.server_address}")
+                        
+                self.response_loader = SystemResponseLoader(
+                    server_address=self.server_address,
+                    max_concurrency=5,
+                    poll_timeout=180.0,
+                    poll_interval=5.0
+                )
+                await self.response_loader.__aenter__()
+            except Exception as e:
+                logger.error(f"Error initializing loader: {str(e)}")
+                raise
 
     @staticmethod
     async def load_from_file(path: Union[str, Path]) -> dict:
@@ -132,51 +135,49 @@ class TeamManager:
     ) -> AsyncGenerator[Union[AgentEvent | ChatMessage | LLMCallEvent, ChatMessage, TeamResult], None]:
         """Stream team execution results"""
         start_time = time.time()
-        team = None
-
-        # Setup logger correctly
-        logger = logging.getLogger(EVENT_LOGGER_NAME)
-        logger.setLevel(logging.INFO)
-        llm_event_logger = RunEventLogger()
-        logger.handlers = [llm_event_logger]  # Replace all handlers
 
         try:
-            team = await self._create_team(team_config, input_func)
+            # Initialize the response loader
+            await self.initialize_loader()
 
-            if use_agents:
-                async for message in team.run_stream(task=task, cancellation_token=cancellation_token):
-                    if cancellation_token and cancellation_token.is_cancelled():
-                        break
+            # Send the task to prod
+            result = await self.response_loader.add_request(input_text=task)
+            task_id = result.get("task_id")
 
-                if isinstance(message, TaskResult):
-                    yield TeamResult(task_result=message, usage="", duration=time.time() - start_time)
-                else:
-                    yield message
+            if not task_id:
+                raise ValueError("Failed to get task_id from prod server")
 
-                ### Check for any LLM events
-                while not llm_event_logger.events.empty():
-                    event = await llm_event_logger.events.get()
-                    yield event
-            
-            else:
-                for (message, execution_time) in messages:
-                    await asyncio.sleep(execution_time)
-                    if isinstance(message, UserInputRequestedEvent):
-                        print("User input requested")
-                        res = await input_func(prompt="What should be done?")
-                        message = TextMessage(content=res, source="user")
-                    
-                    yield message
+            while True:
+                if cancellation_token and cancellation_token.is_cancelled():
+                    break
 
-        finally:
-            # Cleanup - remove our handler
-            logger.handlers.remove(llm_event_logger)
+                result = await self.response_loader.get_result(task_id)
+                if result["status"] == "completed":
+                    logger.info(f"Got result {result}")
+                    yield TextMessage(
+                        content=result.get("response", "No response"),
+                        source="prod_system"
+                    )
+                    break
+                await asyncio.sleep(1)
 
-            # Ensure cleanup happens
-            if team and hasattr(team, "_participants"):
-                for agent in team._participants:
-                    if hasattr(agent, "close"):
-                        await agent.close()
+            # yield TextMessage(
+            #     content="Something went wrong...",
+            #     source="system"
+            # )
+
+        except Exception as e:
+            logger.error(f"Error in run_stream: {str(e)}")
+            yield TextMessage(
+                content=f"Error occurred: {str(e)}",
+                source="system"
+            )
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self.response_loader:
+            await self.response_loader.cleanup()
+            self.response_loader = None
 
     async def run(
         self,
