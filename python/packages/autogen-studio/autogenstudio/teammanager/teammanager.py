@@ -40,7 +40,8 @@ class TeamManager:
 
     def __init__(self):
         self.response_loader = None
-        self.server_address = "http://172.17.0.1:51005"
+        self.server_address = "http://localhost:51005"
+        # self.server_address = "http://158.160.160.132:51005"
         logger.info(f"Initialized TeamManager with server address: {self.server_address}")
 
     async def initialize_loader(self):
@@ -152,7 +153,6 @@ class TeamManager:
                 if result["status"] == "completed":
                     logger.info(f"Got result {result}")
                     
-                    # Отправляем основной ответ
                     yield TextMessage(
                         content=result.get("response", "No response"),
                         source="prod_system"
@@ -160,27 +160,57 @@ class TeamManager:
 
                     dialogue_history = result.get("dialogue_history", {}).get("context", [])
                     if dialogue_history:
-                        memory_contents = []
                         for msg in dialogue_history:
-                            if msg.get("type") == "AssistantMessage":
-                                content = msg.get("content", "")
+                            msg_type = msg.get("type")
+                            content = msg.get("content")
+
+                            if msg_type == "AssistantMessage":
                                 if isinstance(content, str):
-                                    memory_contents.append(
-                                        MemoryContent(
-                                            content=content,
-                                            role="assistant",
-                                            mime_type="text/plain"
-                                        )
+                                    yield TextMessage(
+                                        content=content,
+                                        source="assistant"
+                                    )
+                                elif isinstance(content, list):  # tool call request
+                                    tool_call = content[0]
+                                    yield ToolCallRequestEvent(
+                                        content=content,
+                                        function_name=tool_call.get("name"),
+                                        arguments=tool_call.get("arguments"),
+                                        call_id=tool_call.get("id"),
+                                        source="assistant"
                                     )
 
-                        if memory_contents:
-                            yield MemoryQueryEvent(
-                                query="dialogue_history",
-                                results=memory_contents,
-                                source="memory",
-                                content="Retrieved dialogue history"
-                            )
-                    break
+                            elif msg_type == "FunctionExecutionResultMessage":
+                                if isinstance(content, list):
+                                    tool_result = content[0]
+                                    yield ToolCallExecutionEvent(
+                                        content=content,
+                                        function_name="tool_execution",
+                                        result=FunctionExecutionResult(
+                                            content=tool_result.get("content"),
+                                            call_id=tool_result.get("call_id")
+                                        ),
+                                        call_id=tool_result.get("call_id"),
+                                        source="system"
+                                    )
+                    
+                    # final result
+                    task_result = TaskResult(
+                        messages=[TextMessage(
+                            content=result.get("response"),
+                            source="assistant"
+                        )]
+                    )
+                    task_result.success = True
+                    
+                    yield TeamResult(
+                        task_result=task_result,
+                        usage="",
+                        duration=time.time() - start_time
+                    )
+                    
+                    await self.cleanup()
+                    return
                     
                 await asyncio.sleep(1)
 
@@ -190,6 +220,7 @@ class TeamManager:
                 content=f"Error occurred: {str(e)}",
                 source="system"
             )
+            await self.cleanup()
 
     async def cleanup(self):
         """Cleanup resources"""
