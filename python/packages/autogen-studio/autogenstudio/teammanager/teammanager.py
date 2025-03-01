@@ -134,85 +134,94 @@ class TeamManager:
         input_func: Optional[Callable] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> AsyncGenerator[Union[AgentEvent | ChatMessage | LLMCallEvent, ChatMessage, TeamResult], None]:
-        """Stream team execution results"""
         start_time = time.time()
+        previous_task_id = None
+        dialogue_history = []  # Накапливаем историю диалога
 
         try:
             await self.initialize_loader()
-            result = await self.response_loader.add_request(input_text=task)
-            task_id = result.get("task_id")
-
-            if not task_id:
-                raise ValueError("Failed to get task_id from prod server")
-
+            
             while True:
                 if cancellation_token and cancellation_token.is_cancelled():
                     break
 
-                result = await self.response_loader.get_result(task_id)
-                if result["status"] == "completed":
-                    logger.info(f"Got result {result}")
-                    
-                    yield TextMessage(
-                        content=result.get("response", "No response"),
-                        source="prod_system"
-                    )
+                result = await self.response_loader.add_request(
+                    input_text=task,
+                    config={
+                        "previous_task_id": previous_task_id,
+                        "dialogue_history": dialogue_history
+                    } if previous_task_id else None
+                )
+                
+                current_task_id = result.get("task_id")
+                if not current_task_id:
+                    raise ValueError("Failed to get task_id from server")
+                
+                logger.info(f"Processing message with task_id: {current_task_id} (previous: {previous_task_id})")
 
-                    dialogue_history = result.get("dialogue_history", {}).get("context", [])
-                    if dialogue_history:
-                        for msg in dialogue_history:
-                            msg_type = msg.get("type")
-                            content = msg.get("content")
+                while True:
+                    result = await self.response_loader.get_result(current_task_id)
+                    if result["status"] == "completed":
+                        logger.info(f"Got result {result}")
+                        
+                        if result.get("dialogue_history", {}).get("context"):
+                            new_messages = result["dialogue_history"]["context"]
+                            dialogue_history.extend(new_messages)
+                        
+                        yield TextMessage(
+                            content=result.get("response", "No response"),
+                            source="prod_system"
+                        )
 
-                            if msg_type == "AssistantMessage":
-                                if isinstance(content, str):
-                                    yield TextMessage(
-                                        content=content,
-                                        source="assistant"
-                                    )
-                                elif isinstance(content, list):  # tool call request
-                                    tool_call = content[0]
-                                    yield ToolCallRequestEvent(
-                                        content=content,
-                                        function_name=tool_call.get("name"),
-                                        arguments=tool_call.get("arguments"),
-                                        call_id=tool_call.get("id"),
-                                        source="assistant"
-                                    )
+                        dialogue_history = result.get("dialogue_history", {}).get("context", [])
+                        if dialogue_history:
+                            for msg in dialogue_history:
+                                msg_type = msg.get("type")
+                                content = msg.get("content")
 
-                            elif msg_type == "FunctionExecutionResultMessage":
-                                if isinstance(content, list):
-                                    tool_result = content[0]
-                                    yield ToolCallExecutionEvent(
-                                        content=content,
-                                        function_name="tool_execution",
-                                        result=FunctionExecutionResult(
-                                            content=tool_result.get("content"),
-                                            call_id=tool_result.get("call_id")
-                                        ),
-                                        call_id=tool_result.get("call_id"),
-                                        source="system"
-                                    )
-                    
-                    # final result
-                    task_result = TaskResult(
-                        messages=[TextMessage(
-                            content=result.get("response"),
-                            source="assistant"
-                        )]
-                    )
-                    task_result.success = True
-                    
-                    yield TeamResult(
-                        task_result=task_result,
-                        usage="",
-                        duration=time.time() - start_time
-                    )
-                    
-                    await self.cleanup()
-                    return
-                    
-                await asyncio.sleep(1)
+                                if msg_type == "AssistantMessage":
+                                    if isinstance(content, str):
+                                        yield TextMessage(
+                                            content=content,
+                                            source="assistant"
+                                        )
+                                    elif isinstance(content, list):
+                                        tool_call = content[0]
+                                        yield ToolCallRequestEvent(
+                                            content=content,
+                                            function_name=tool_call.get("name"),
+                                            arguments=tool_call.get("arguments"),
+                                            call_id=tool_call.get("id"),
+                                            source="assistant"
+                                        )
+
+                                elif msg_type == "FunctionExecutionResultMessage":
+                                    if isinstance(content, list):
+                                        tool_result = content[0]
+                                        yield ToolCallExecutionEvent(
+                                            content=content,
+                                            function_name="tool_execution",
+                                            result=FunctionExecutionResult(
+                                                content=tool_result.get("content"),
+                                                call_id=tool_result.get("call_id")
+                                            ),
+                                            call_id=tool_result.get("call_id"),
+                                            source="system"
+                                        )
+
+                        if input_func:
+                            yield UserInputRequestedEvent(
+                                request_id=current_task_id,
+                                source="system"
+                            )
+                            task = await input_func(prompt="Continue the conversation:")
+                            if task.lower() in ["exit", "quit", "bye"]:
+                                return
+                            
+                            previous_task_id = current_task_id
+                            break
+                            
+                    await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"Error in run_stream: {str(e)}")
@@ -220,6 +229,7 @@ class TeamManager:
                 content=f"Error occurred: {str(e)}",
                 source="system"
             )
+        finally:
             await self.cleanup()
 
     async def cleanup(self):
