@@ -135,8 +135,7 @@ class TeamManager:
         cancellation_token: Optional[CancellationToken] = None,
     ) -> AsyncGenerator[Union[AgentEvent | ChatMessage | LLMCallEvent, ChatMessage, TeamResult], None]:
         start_time = time.time()
-        previous_task_id = None
-        dialogue_history = []  # Накапливаем историю диалога
+        current_task_id = None
 
         try:
             await self.initialize_loader()
@@ -145,28 +144,23 @@ class TeamManager:
                 if cancellation_token and cancellation_token.is_cancelled():
                     break
 
+                # Отправляем запрос с существующим task_id или получаем новый
                 result = await self.response_loader.add_request(
                     input_text=task,
-                    config={
-                        "previous_task_id": previous_task_id,
-                        "dialogue_history": dialogue_history
-                    } if previous_task_id else None
+                    config={"task_id": current_task_id} if current_task_id else None
                 )
                 
-                current_task_id = result.get("task_id")
                 if not current_task_id:
-                    raise ValueError("Failed to get task_id from server")
+                    current_task_id = result.get("task_id")
+                    if not current_task_id:
+                        raise ValueError("Failed to get task_id from server")
                 
-                logger.info(f"Processing message with task_id: {current_task_id} (previous: {previous_task_id})")
+                logger.info(f"Processing message with task_id: {current_task_id}")
 
                 while True:
                     result = await self.response_loader.get_result(current_task_id)
                     if result["status"] == "completed":
                         logger.info(f"Got result {result}")
-                        
-                        if result.get("dialogue_history", {}).get("context"):
-                            new_messages = result["dialogue_history"]["context"]
-                            dialogue_history.extend(new_messages)
                         
                         yield TextMessage(
                             content=result.get("response", "No response"),
@@ -211,14 +205,13 @@ class TeamManager:
 
                         if input_func:
                             yield UserInputRequestedEvent(
-                                request_id=current_task_id,
+                                request_id=current_task_id,  # Используем тот же task_id
                                 source="system"
                             )
                             task = await input_func(prompt="Continue the conversation:")
                             if task.lower() in ["exit", "quit", "bye"]:
                                 return
-                            
-                            previous_task_id = current_task_id
+                            # Продолжаем с тем же task_id
                             break
                             
                     await asyncio.sleep(1)

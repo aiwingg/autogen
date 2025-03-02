@@ -130,12 +130,15 @@ class SystemResponseLoader:
         while True:
             try:
                 status = await self.__check_task_status(task_id)
-                used_tools = []
                 responses = status.get("messages", [])
+                
                 if responses:
                     last_response = responses[-1]
                     dialogue_history = last_response.get("context", [])
+                    
                     call_id_to_tool_info = {}
+                    used_tools = []
+                    
                     for element in dialogue_history:
                         if element['type'] == 'FunctionExecutionResultMessage':
                             for tool_result in element['content']:
@@ -144,43 +147,36 @@ class SystemResponseLoader:
                         if element['type'] == 'AssistantMessage' and isinstance(element['content'], list):
                             for tool_call in element['content']:
                                 tool_call_record = {
-                                    'name' : tool_call['name'],
-                                    'args' : tool_call['arguments'],
-                                    'id' : tool_call['id']
+                                    'name': tool_call['name'],
+                                    'args': tool_call['arguments'],
+                                    'id': tool_call['id']
                                 }
                                 call_id_to_tool_info[tool_call['id']] = tool_call_record
                             print('current call_id_to_tool_info', call_id_to_tool_info)
-                            
-                    used_tools = [tool_call_record['name'] for tool_call_record in call_id_to_tool_info.values()]
-                    used_tools = list(set(used_tools))
+                    
+                    if call_id_to_tool_info:
+                        used_tools = [tool_call_record['name'] for tool_call_record in call_id_to_tool_info.values()]
+                        used_tools = list(set(used_tools))
 
-                if len(used_tools) > 0:
-                    response = ""
                     if dialogue_history and isinstance(dialogue_history[-1], dict):
                         response = dialogue_history[-1].get("content", "")
-                    logger.info("Task %s completed with tools %s", task_id, used_tools)
-                    return {
-                        "status": "completed",
-                        "used_tools": used_tools,
-                        "response": response,
-                        "dialogue_history": responses[-1]
-                    }
+                        if response:
+                            logger.info("Task %s completed with response: %s", task_id, response)
+                            return {
+                                "status": "completed",
+                                "used_tools": used_tools,
+                                "response": response,
+                                "dialogue_history": responses[-1]
+                            }
 
                 elapsed = time.time() - start_time
                 if elapsed > self.poll_timeout:
-                    logger.warning(
-                        "Task %s timed out after %.1f seconds",
-                        task_id, self.poll_timeout
-                    )
+                    logger.warning("Task %s timed out after %.1f seconds", task_id, self.poll_timeout)
                     return {
                         "status": "timeout",
                         "error": f"Task timed out after {self.poll_timeout:.1f} seconds"
                     }
                 
-                logger.debug(
-                    "Task %s still processing, checking again in %.1f seconds",
-                    task_id, self.poll_interval
-                )
                 await asyncio.sleep(self.poll_interval)
                 
             except Exception as e:
