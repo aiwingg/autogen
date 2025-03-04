@@ -16,46 +16,12 @@ from autogen_agentchat.base import TaskResult
 from autogen_core import FunctionCall
 from autogen_core.models import FunctionExecutionResult
 from autogen_core.memory import MemoryContent
-import random
 from ..datamodel.types import LLMCallEventMessage, TeamResult
+from .system_response_loader import SystemResponseLoader
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
-use_agents = False
-
-messages = [
-    (
-        TextMessage(content="Checking the information about the customer in the database", source="manager_agent"),
-        0.0
-    ),
-    (
-        ToolCallRequestEvent(content=[FunctionCall(name="query_customer_info_rag", arguments=json.dumps({"customer_description": "John from the meatstore on placeholder st."}), id="12fqnpweif23")], source="manager_agent"),
-        0.7 + random.random() * 0.3
-    ),
-    (
-        ToolCallExecutionEvent(content=[FunctionExecutionResult(content="John's phone number is 1234567890. He is a regular customer.", call_id="12fqnpweif23")], source="tool_agent"),
-        0.5 + random.random() * 0.3
-    ),
-    (
-        ToolCallRequestEvent(content=[FunctionCall(name="start a phone call", arguments=json.dumps({"phone_number": "1234567890", "message": "the delivery will be delayed by 1 day. The new delivery date should be agreed upon."}), id="phone_call_1")], source="manager_agent"),
-        0.5 + random.random() * 0.3
-    ),
-    (
-        ToolCallExecutionEvent(content=[FunctionExecutionResult(content="""The phone call has been performed. The call transcript:\n
-<div class="retellai-dialog"><b>Operator</b>: Hello, I would like to inform that your order will be delayed</div>\n
-<div class="retellai-dialog"><b>Customer</b>: I want my money back</b></div>\n
-        """, call_id="phone_call_1")], source="tool_agent"),
-        1.0
-    ),
-    (
-        UserInputRequestedEvent(request_id="user_request1", source="manager_agent"),
-        0.1
-    ),
-    (
-        TextMessage(content="The memory was updated", source="memory_agent"),
-        1.1
-    )
-]
 
 class RunEventLogger(logging.Handler):
     """Event logger that queues LLMCallEvents for streaming"""
@@ -71,6 +37,44 @@ class RunEventLogger(logging.Handler):
 
 class TeamManager:
     """Manages team operations including loading configs and running teams"""
+
+    def __init__(self):
+        self.response_loader = None
+        self.server_address = "http://localhost:51005"
+        # self.server_address = "http://158.160.160.132:51005"
+        logger.info(f"Initialized TeamManager with server address: {self.server_address}")
+
+    async def initialize_loader(self):
+        """Initialize the SystemResponseLoader if not already initialized"""
+        if self.response_loader is None:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        logger.info(f"Attempting to connect to server at {self.server_address}")
+                        async with session.get(
+                            f"{self.server_address}/health", 
+                            timeout=5,
+                            ssl=False
+                        ) as response:
+                            if response.status == 200:
+                                logger.info(f"Successfully connected to server at {self.server_address}")
+                            else:
+                                logger.warning(f"Server responded with status {response.status}")
+                                logger.warning(f"Response body: {await response.text()}")
+                    except Exception as e:
+                        logger.error(f"Connection error: {str(e)}")
+                        raise ConnectionError(f"Could not connect to server at {self.server_address}")
+                        
+                self.response_loader = SystemResponseLoader(
+                    server_address=self.server_address,
+                    max_concurrency=5,
+                    poll_timeout=180.0,
+                    poll_interval=5.0
+                )
+                await self.response_loader.__aenter__()
+            except Exception as e:
+                logger.error(f"Error initializing loader: {str(e)}")
+                raise
 
     @staticmethod
     async def load_from_file(path: Union[str, Path]) -> dict:
@@ -130,53 +134,102 @@ class TeamManager:
         input_func: Optional[Callable] = None,
         cancellation_token: Optional[CancellationToken] = None,
     ) -> AsyncGenerator[Union[AgentEvent | ChatMessage | LLMCallEvent, ChatMessage, TeamResult], None]:
-        """Stream team execution results"""
         start_time = time.time()
-        team = None
-
-        # Setup logger correctly
-        logger = logging.getLogger(EVENT_LOGGER_NAME)
-        logger.setLevel(logging.INFO)
-        llm_event_logger = RunEventLogger()
-        logger.handlers = [llm_event_logger]  # Replace all handlers
+        current_task_id = None
 
         try:
-            team = await self._create_team(team_config, input_func)
-
-            if use_agents:
-                async for message in team.run_stream(task=task, cancellation_token=cancellation_token):
-                    if cancellation_token and cancellation_token.is_cancelled():
-                        break
-
-                if isinstance(message, TaskResult):
-                    yield TeamResult(task_result=message, usage="", duration=time.time() - start_time)
-                else:
-                    yield message
-
-                ### Check for any LLM events
-                while not llm_event_logger.events.empty():
-                    event = await llm_event_logger.events.get()
-                    yield event
+            await self.initialize_loader()
             
-            else:
-                for (message, execution_time) in messages:
-                    await asyncio.sleep(execution_time)
-                    if isinstance(message, UserInputRequestedEvent):
-                        print("User input requested")
-                        res = await input_func(prompt="What should be done?")
-                        message = TextMessage(content=res, source="user")
-                    
-                    yield message
+            while True:
+                if cancellation_token and cancellation_token.is_cancelled():
+                    break
 
+                # Отправляем запрос с существующим task_id или получаем новый
+                result = await self.response_loader.add_request(
+                    input_text=task,
+                    config={"task_id": current_task_id} if current_task_id else None
+                )
+                
+                if not current_task_id:
+                    current_task_id = result.get("task_id")
+                    if not current_task_id:
+                        raise ValueError("Failed to get task_id from server")
+                
+                logger.info(f"Processing message with task_id: {current_task_id}")
+
+                while True:
+                    result = await self.response_loader.get_result(current_task_id)
+                    if result["status"] == "completed":
+                        logger.info(f"Got result {result}")
+                        
+                        yield TextMessage(
+                            content=result.get("response", "No response"),
+                            source="prod_system"
+                        )
+
+                        dialogue_history = result.get("dialogue_history", {}).get("context", [])
+                        if dialogue_history:
+                            for msg in dialogue_history:
+                                msg_type = msg.get("type")
+                                content = msg.get("content")
+
+                                if msg_type == "AssistantMessage":
+                                    if isinstance(content, str):
+                                        yield TextMessage(
+                                            content=content,
+                                            source="assistant"
+                                        )
+                                    elif isinstance(content, list):
+                                        tool_call = content[0]
+                                        yield ToolCallRequestEvent(
+                                            content=content,
+                                            function_name=tool_call.get("name"),
+                                            arguments=tool_call.get("arguments"),
+                                            call_id=tool_call.get("id"),
+                                            source="assistant"
+                                        )
+
+                                elif msg_type == "FunctionExecutionResultMessage":
+                                    if isinstance(content, list):
+                                        tool_result = content[0]
+                                        yield ToolCallExecutionEvent(
+                                            content=content,
+                                            function_name="tool_execution",
+                                            result=FunctionExecutionResult(
+                                                content=tool_result.get("content"),
+                                                call_id=tool_result.get("call_id")
+                                            ),
+                                            call_id=tool_result.get("call_id"),
+                                            source="system"
+                                        )
+
+                        if input_func:
+                            yield UserInputRequestedEvent(
+                                request_id=current_task_id,  # Используем тот же task_id
+                                source="system"
+                            )
+                            task = await input_func(prompt="Continue the conversation:")
+                            if task.lower() in ["exit", "quit", "bye"]:
+                                return
+                            # Продолжаем с тем же task_id
+                            break
+                            
+                    await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Error in run_stream: {str(e)}")
+            yield TextMessage(
+                content=f"Error occurred: {str(e)}",
+                source="system"
+            )
         finally:
-            # Cleanup - remove our handler
-            logger.handlers.remove(llm_event_logger)
+            await self.cleanup()
 
-            # Ensure cleanup happens
-            if team and hasattr(team, "_participants"):
-                for agent in team._participants:
-                    if hasattr(agent, "close"):
-                        await agent.close()
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self.response_loader:
+            await self.response_loader.cleanup()
+            self.response_loader = None
 
     async def run(
         self,
